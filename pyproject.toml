@@ -1,0 +1,17 @@
+[project]
+name = "buggy-app"
+version = "0.1.0"
+description = "Intentionally buggy Python project for testing static analysis tools"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "S", "N", "C90", "PL", "A", "UP", "SIM", "RET", "ARG", "ERA", "T20"]
+
+[tool.coverage.run]
+relative_files = true

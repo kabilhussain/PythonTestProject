@@ -1,0 +1,7 @@
+# BUG D1: deliberately outdated dependencies with known CVEs (for pip-audit / SCA tools)
+requests==2.19.1
+PyYAML==5.3
+Flask==0.12.2
+Jinja2==2.10
+urllib3==1.24.1
+Django==2.2.0
