@@ -1,0 +1,269 @@
+# Repo Scan: scans ANY GitHub repository with the selected tools.
+# It lives in your "scanner" repo, so the repo being reviewed needs no extra files.
+# n8n (RepoScanRunner) starts it with workflow_dispatch and reads the "scan-results" artifact.
+#
+# Secret SCAN_TOKEN (optional, but needed for private repos and for dependency fixes):
+#   a GitHub token with Contents read (private repos) and Contents write
+#   (to push the npm audit fix commit to the fix branch) on the target repo.
+#
+# Only scan repositories you trust: ESLint loads the target repo's own config file, which is code.
+
+name: Repo Scan
+run-name: "Repo scan ${{ inputs.run_key }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Repository to scan, as owner/repo"
+        required: true
+      target_ref:
+        description: "Branch to scan (empty = default branch)"
+        required: false
+        default: ""
+      tools:
+        description: "Comma-separated: semgrep,osv,npm-audit,eslint,gitleaks,trivy"
+        required: false
+        default: "semgrep,osv,npm-audit,eslint,gitleaks,trivy"
+      fix_deps:
+        description: "Fix dependencies (upgrades below, then npm audit fix) and push the result to target_ref"
+        type: boolean
+        required: false
+        default: false
+      dep_upgrades:
+        description: "Direct dependency upgrades, as dir|package@version;dir|package@version (dir . = repo root)"
+        required: false
+        default: ""
+      run_key:
+        description: "Unique key from n8n, used to find this run"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-scan-${{ inputs.run_key }}
+  cancel-in-progress: false
+
+env:
+  # Pin these once the setup works, so a scanner update cannot change results silently.
+  SEMGREP_IMAGE: semgrep/semgrep:latest
+  OSV_IMAGE: ghcr.io/google/osv-scanner:latest
+  GITLEAKS_IMAGE: zricethezav/gitleaks:latest
+  TRIVY_IMAGE: aquasec/trivy:latest
+  TOOLS: ",${{ inputs.tools }},"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout scanner scripts
+        uses: actions/checkout@v4
+        with:
+          path: scanner
+          sparse-checkout: .github/scripts
+
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.target_ref }}
+          token: ${{ secrets.SCAN_TOKEN || github.token }}
+          path: target
+          persist-credentials: false   # the token is not left in git config while the target's code runs
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Find npm projects
+        working-directory: target
+        run: |
+          mkdir -p .quality
+          # One line per folder with a package.json (empty line = repo root). At most 10.
+          find . -name package.json -not -path '*/node_modules/*' -not -path './.quality/*' -printf '%h\n' \
+            | sed -e 's#^\./##' -e 's#^\.$##' | sort -u | head -n 10 > .quality/npm-dirs.txt
+          echo "npm projects:"; sed 's/^$/(root)/' .quality/npm-dirs.txt
+
+      - name: Fix dependencies
+        if: ${{ inputs.fix_deps == true || inputs.fix_deps == 'true' }}
+        working-directory: target
+        env:
+          SCAN_TOKEN: ${{ secrets.SCAN_TOKEN }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_REF: ${{ inputs.target_ref }}
+          RUN_KEY: ${{ inputs.run_key }}
+          DEP_UPGRADES: ${{ inputs.dep_upgrades }}
+        run: |
+          set +e
+          if [ -z "$SCAN_TOKEN" ]; then
+            echo "The SCAN_TOKEN secret is missing, so dependency fixes cannot be pushed to $TARGET_REPO." > .quality/fix-deps.error
+            exit 0
+          fi
+          if [ -z "$TARGET_REF" ]; then
+            echo "target_ref must be a branch name to push dependency fixes." > .quality/fix-deps.error
+            exit 0
+          fi
+          LOG=.quality/fix-deps.log; : > "$LOG"
+          # 1. Upgrade direct dependencies to the fixed versions the advisories name.
+          #    Only packages that are already listed in that package.json; the version style (exact or range) is kept.
+          IFS=';' read -ra UPS <<< "$DEP_UPGRADES"
+          for up in "${UPS[@]}"; do
+            [ -n "$up" ] || continue
+            dir="${up%%|*}"; spec="${up#*|}"; name="${spec%@*}"
+            if ! [[ "$dir" =~ ^[A-Za-z0-9._/-]+$ && "$spec" =~ ^@?[A-Za-z0-9._/-]+@[0-9][A-Za-z0-9.+-]*$ ]] || [[ "$dir" == *..* ]]; then
+              echo "Skipped (not a valid entry): $up" >> "$LOG"; continue
+            fi
+            [ -f "$dir/package.json" ] || { echo "Skipped (no package.json in $dir): $up" >> "$LOG"; continue; }
+            where=$(cd "$dir" && node -e '
+              const p = require("./package.json"); const n = process.argv[1];
+              for (const k of ["dependencies", "devDependencies", "optionalDependencies"])
+                if (p[k] && p[k][n] !== undefined) { console.log(k + " " + p[k][n]); process.exit(0); }
+              process.exit(3);' "$name")
+            if [ $? -ne 0 ]; then echo "Skipped ($name is not a direct dependency in $dir)" >> "$LOG"; continue; fi
+            kind="${where%% *}"; current="${where#* }"
+            flags="--package-lock-only --ignore-scripts --no-audit --no-fund"
+            [[ "$current" =~ ^[0-9] ]] && flags="$flags --save-exact"
+            [ "$kind" = "devDependencies" ] && flags="$flags --save-dev"
+            [ "$kind" = "optionalDependencies" ] && flags="$flags --save-optional"
+            # shellcheck disable=SC2086
+            if ( cd "$dir" && npm install $flags "$spec" ) >> "$LOG" 2>&1; then
+              echo "Upgraded $name from $current to ${spec##*@} in $dir" >> "$LOG"
+            else
+              echo "Could not upgrade $spec in $dir" >> "$LOG"
+            fi
+          done
+          # 2. Let npm fix what it can inside the allowed version ranges (lockfile only, nothing is installed).
+          while IFS= read -r d; do
+            dir="${d:-.}"
+            [ -f "$dir/package-lock.json" ] || continue
+            ( cd "$dir" && npm audit fix --package-lock-only --ignore-scripts --no-fund ) >> "$LOG" 2>&1
+          done < .quality/npm-dirs.txt
+          # 3. Commit only changed package.json / package-lock.json files that are already tracked.
+          git add -u -- '*package.json' '*package-lock.json'
+          if ! git diff --cached --quiet; then
+            git config user.name "thechief-bot"
+            git config user.email "thechief-bot@users.noreply.github.com"
+            git commit -m "fix(deps): upgrade vulnerable dependencies [$RUN_KEY]" >> "$LOG" 2>&1
+            if git push "https://x-access-token:${SCAN_TOKEN}@github.com/${TARGET_REPO}.git" "HEAD:refs/heads/${TARGET_REF}" >> "$LOG" 2>&1; then
+              echo "DEPS_FIXED=true" >> "$GITHUB_ENV"
+            else
+              echo "Pushing the dependency fix to $TARGET_REF failed. Check that SCAN_TOKEN has Contents write on $TARGET_REPO." > .quality/fix-deps.error
+            fi
+          else
+            echo "No dependency changes were possible." >> "$LOG"
+          fi
+          grep -E '^(Upgraded|Skipped|Could not|No dependency)' "$LOG" > .quality/fix-deps.summary || true
+
+      # Tools that read source files run before any node_modules is installed.
+      - name: Gitleaks (secrets)
+        if: contains(env.TOOLS, ',gitleaks,')
+        working-directory: target
+        run: |
+          start=$(date +%s); set +e
+          docker run --rm -v "$PWD:/repo" "$GITLEAKS_IMAGE" detect --source /repo --no-git --redact \
+            --report-format json --report-path /repo/.quality/gitleaks.json --exit-code 0 2> .quality/gitleaks.log
+          rc=$?
+          [ $rc -eq 0 ] || echo "Gitleaks failed (exit $rc): $(tail -n 3 .quality/gitleaks.log)" > .quality/gitleaks.error
+          echo $(( $(date +%s) - start )) > .quality/gitleaks.seconds
+
+      - name: Semgrep (code security and bugs, all languages)
+        if: contains(env.TOOLS, ',semgrep,')
+        working-directory: target
+        run: |
+          start=$(date +%s); set +e
+          docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" semgrep scan \
+            --config p/default --config p/secrets --metrics=off \
+            --exclude .quality --json . > .quality/semgrep.json 2> .quality/semgrep.log
+          rc=$?
+          [ $rc -eq 0 ] || echo "Semgrep failed (exit $rc): $(tail -n 3 .quality/semgrep.log)" > .quality/semgrep.error
+          echo $(( $(date +%s) - start )) > .quality/semgrep.seconds
+
+      - name: OSV-Scanner (dependencies, all ecosystems)
+        if: contains(env.TOOLS, ',osv,')
+        working-directory: target
+        run: |
+          start=$(date +%s); set +e
+          docker run --rm -v "$PWD:/src" "$OSV_IMAGE" scan source -r --format json /src > .quality/osv.json 2> .quality/osv.log
+          rc=$?
+          # 0 = nothing found, 1 = vulnerabilities found, 128 = no lockfiles found. Anything else is an error.
+          if [ $rc -eq 128 ]; then echo '{"results":[]}' > .quality/osv.json
+          elif [ $rc -gt 1 ]; then echo "OSV-Scanner failed (exit $rc): $(tail -n 3 .quality/osv.log)" > .quality/osv.error; fi
+          echo $(( $(date +%s) - start )) > .quality/osv.seconds
+
+      - name: Trivy (dependencies and configuration)
+        if: contains(env.TOOLS, ',trivy,')
+        working-directory: target
+        run: |
+          start=$(date +%s); set +e
+          docker run --rm -v "$PWD:/src" "$TRIVY_IMAGE" fs --quiet --scanners vuln,misconfig --format json \
+            --skip-dirs /src/.quality /src > .quality/trivy.json 2> .quality/trivy.log
+          rc=$?
+          [ $rc -eq 0 ] || echo "Trivy failed (exit $rc): $(tail -n 3 .quality/trivy.log)" > .quality/trivy.error
+          echo $(( $(date +%s) - start )) > .quality/trivy.seconds
+
+      - name: npm audit (every npm project)
+        if: contains(env.TOOLS, ',npm-audit,')
+        working-directory: target
+        run: |
+          start=$(date +%s); set +e
+          Q="$PWD/.quality"
+          while IFS= read -r d; do
+            dir="${d:-.}"; slug=$(echo "${d:-root}" | tr '/ ' '__')
+            echo "$d" > "$Q/npm-audit.$slug.dir"
+            (
+              cd "$dir" || exit 0
+              [ -f package-lock.json ] || npm install --package-lock-only --ignore-scripts > /dev/null 2>&1
+              # Exit code 1 means "vulnerabilities found". Real errors show up as an "error" key in the JSON.
+              npm audit --json > "$Q/npm-audit.$slug.json" 2> /dev/null
+            )
+          done < "$Q/npm-dirs.txt"
+          [ -s "$Q/npm-dirs.txt" ] || echo "No package.json found in the repository" > "$Q/npm-audit.error"
+          echo $(( $(date +%s) - start )) > "$Q/npm-audit.seconds"
+
+      - name: ESLint (every npm project with an ESLint config)
+        if: contains(env.TOOLS, ',eslint,')
+        working-directory: target
+        run: |
+          start=$(date +%s); set +e
+          Q="$PWD/.quality"; found=0
+          while IFS= read -r d; do
+            dir="${d:-.}"; slug=$(echo "${d:-root}" | tr '/ ' '__')
+            ls "$dir"/eslint.config.* "$dir"/.eslintrc* > /dev/null 2>&1 || continue
+            found=1
+            (
+              cd "$dir" || exit 0
+              (npm ci --ignore-scripts || npm install --ignore-scripts) > "$Q/eslint.$slug.log" 2>&1
+              npx --no-install eslint . -f json -o "$Q/eslint.$slug.json" >> "$Q/eslint.$slug.log" 2>&1
+              rc=$?
+              # 0 = clean, 1 = problems found, 2 = ESLint itself failed
+              [ $rc -le 1 ] || echo "ESLint failed in ${d:-root} (exit $rc): $(tail -n 2 "$Q/eslint.$slug.log")" > "$Q/eslint.$slug.error"
+            )
+          done < "$Q/npm-dirs.txt"
+          [ $found -eq 1 ] || echo "No ESLint config found in any npm project" > "$Q/eslint.error"
+          echo $(( $(date +%s) - start )) > "$Q/eslint.seconds"
+
+      - name: Normalise findings
+        if: always()
+        working-directory: target
+        env:
+          TOOLS_CSV: ${{ inputs.tools }}
+          RUN_KEY: ${{ inputs.run_key }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          GITHUB_WORKSPACE="$PWD" SHA=$(git rev-parse HEAD) TOOLS="$TOOLS_CSV" APP_DIR="" \
+          DEPS_FIXED="${DEPS_FIXED:-false}" node ../scanner/.github/scripts/normalize.mjs
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: |
+            target/.quality/findings.json
+            target/.quality/*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
